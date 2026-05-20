@@ -60,19 +60,21 @@ class Dreamer:
         embs = self._compute_embeddings(embed_fn, device)  # (N, D)
         embs = embs / (embs.norm(dim=1, keepdim=True) + 1e-8)
         sims = embs @ embs.t()  # (N, N)
-        sims = sims.numpy()
+        sims = sims.float().numpy()
 
         for i in range(N):
             self.graph.add_node(i, label=self._short_label(self.memories[i]))
 
         for i in range(N):
             row = sims[i].copy()
-            row[i] = -1.0
-            neighs = np.argpartition(-row, range(min(top_k, N - 1)))[:min(top_k, N - 1)]
+            row[i] = -np.inf
+            k = min(top_k, N - 1)
+            if k == 0:
+                continue
+            neighs = np.argpartition(-row, k - 1)[:k]
             for j in neighs:
                 weight = float(sims[i, j])
-                if weight > 0.0:
-                    self.graph.add_edge(i, int(j), weight=weight)
+                self.graph.add_edge(i, int(j), weight=weight)
         return self.graph
 
     def _short_label(self, seq: torch.Tensor, max_chars: int = 60):
@@ -99,7 +101,7 @@ class Dreamer:
             w = data.get('weight', 1.0)
             net.add_edge(int(u), int(v), value=w)
 
-        net.show(out_html)
+        net.write_html(out_html)
 
     def dream(self, model, tokenizer, optimizer, device: torch.device, steps: int = 4, samples: int = 8):
         """Perform dreaming by sampling graph neighborhoods and training briefly."""
