@@ -2,31 +2,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional
+import os
+import argparse
+from typing import Optional, List, Dict
 from dataclasses import dataclass
+from dreamer import Dreamer
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 
 @dataclass
 class HybridConfig:
     vocab_size: int = 50257
-    hidden_size: int = 384
-    num_layers: int = 8
+    hidden_size: int = 128
+    num_layers: int = 2
     num_heads: int = 8
     ssm_state_size: int = 16
     conv_kernel: int = 4
     expand_factor: int = 2
     layer_pattern: str = "MMAMAMAM"
     
-    # Training
-    max_seq_len: int = 512
-    batch_size: int = 32  # Increased for better GPU utilization
-    num_documents: int = 5000
+    # Training (smaller defaults for safe local runs)
+    max_seq_len: int = 64
+    batch_size: int = 1
+    num_documents: int = 200
     learning_rate: float = 5e-4
-    num_steps: int = 10000
+    num_steps: int = 20
     
     dropout: float = 0.1
     grad_clip: float = 1.0
@@ -107,7 +110,10 @@ class HybridBlock(nn.Module):
         return x + self.dropout(self.mixer(self.norm(x)))
 
 
-@torch.compile  # JIT compile the model for faster execution
+# Allow disabling torch.compile via environment (useful to reduce memory)
+compile_fn = torch.compile if os.getenv('USE_TORCH_COMPILE', '0') == '1' else (lambda x: x)
+
+@compile_fn
 class HybridModel(nn.Module):
     def __init__(self, config: HybridConfig):
         super().__init__()
@@ -146,6 +152,29 @@ class TextDataset(Dataset):
         return torch.tensor(self.tokens[start:start + self.max_length], dtype=torch.long)
 
 
+class HFModelWrapper(nn.Module):
+    """Wraps HF model to return (logits, loss) tuple like our HybridModel"""
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model
+    
+    def forward(self, input_ids, labels=None):
+        output = self.model(input_ids=input_ids, labels=labels)
+        return output.logits, output.loss
+    
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+    
+    def train(self, mode=True):
+        self.model.train(mode)
+        return self
+    
+    def eval(self):
+        self.model.eval()
+        return self
+
+
+
 def main():
     torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
     torch.set_float32_matmul_precision('high')  # Use TF32 on Ampere GPUs
@@ -153,25 +182,66 @@ def main():
     device = torch.device('cuda')
     print(f"Using device: {device}")
     
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model-name', type=str, default='Qwen/Qwen3-0.6B', help='HF model id to fine-tune (optional)')
+    parser.add_argument('--dataset', type=str,  default="Malikeh1375/medical-question-answering-datasets", help='Hugging Face dataset id to use')
+    parser.add_argument('--dataset-config', type=str, default='medical_meadow_health_advice', help='Config name for HF datasets with multiple configs')
+    parser.add_argument('--use-qwen', action='store_true', help='Use HF Qwen-style model path instead of local HybridModel')
+    parser.add_argument('--batch-size', type=int, default=None, help='Override training batch size')
+    parser.add_argument('--max-seq-len', type=int, default=None, help='Override max sequence length')
+    parser.add_argument('--hidden-size', type=int, default=None, help='Override model hidden size')
+    parser.add_argument('--num-layers', type=int, default=None, help='Override number of layers')
+    parser.add_argument('--dream-every', type=int, default=200, help='Run dream phase every N steps')
+    parser.add_argument('--dream-steps', type=int, default=4, help='Number of mini-steps during dream')
+    parser.add_argument('--grad-accum', type=int, default=1, help='Gradient accumulation steps to reduce memory')
+    parser.add_argument('--num-documents', type=int, default=200, help='Number of documents to sample/tokenize')
+    # default to using Qwen model unless explicitly disabled
+    parser.set_defaults(use_qwen=True)
+    args = parser.parse_args()
+
     # Config
     config = HybridConfig()
-    
-    # Load data
+    config.num_documents = args.num_documents
+
+    # apply runtime overrides to keep quick experiments small
+    if args.batch_size:
+        config.batch_size = args.batch_size
+    if args.max_seq_len:
+        config.max_seq_len = args.max_seq_len
+    if args.hidden_size:
+        config.hidden_size = args.hidden_size
+        config.intermediate_size = config.expand_factor * config.hidden_size
+    if args.num_layers:
+        config.num_layers = args.num_layers
+
+    # Load data (streaming)
     print("Loading data...")
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
+    if args.dataset_config:
+        dataset = load_dataset(args.dataset, args.dataset_config, split='train', streaming=True)
+    else:
+        dataset = load_dataset(args.dataset, split='train', streaming=True)
+
+    # tokenizer: will be set differently depending on model selection
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token or tokenizer.pad_token
-    
-    dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
-    
-    # Tokenize in one go for efficiency
+
+    # Tokenize into token stream
     all_tokens = []
     for i, item in enumerate(tqdm(dataset, total=config.num_documents, desc="Tokenizing")):
         if i >= config.num_documents:
             break
-        tokens = tokenizer.encode(item["text"][:3000], add_special_tokens=False)
+        # try some common text fields
+        text = None
+        for key in ("text", "article", "context", "passage", "question", "snippet"):
+            if key in item:
+                text = item[key]
+                break
+        if text is None:
+            text = str(item)
+        tokens = tokenizer.encode(text[:3000], add_special_tokens=False)
         all_tokens.extend(tokens)
-    
-    config.vocab_size = tokenizer.vocab_size
+
+    config.vocab_size = getattr(tokenizer, 'vocab_size', config.vocab_size)
     
     # Create dataset
     train_dataset = TextDataset(all_tokens, config.max_seq_len)
@@ -185,8 +255,13 @@ def main():
         prefetch_factor=2
     )
     
-    # Create model - use DataParallel for multi-GPU
-    model = HybridModel(config)
+    # Create model - either HF model (qwen) or local HybridModel
+    if args.use_qwen:
+        print(f"Loading HF model {args.model_name}...")
+        hf_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        model = HFModelWrapper(hf_model)
+    else:
+        model = HybridModel(config)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
@@ -196,50 +271,110 @@ def main():
     print(f"Model: {total_params:,} parameters, {config.num_layers} layers ({config.layer_pattern})")
     
     # Optimizer and AMP
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, fused=True)  # Fused optimizer
-    scaler = GradScaler()
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, fused=True)
+    except Exception:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    # Skip GradScaler for models with BFloat16 (e.g., Qwen)
+    # Just use autocast for mixed precision
+    scaler = None
+
+    # Dreamer: collect past batches and occasionally 'dream'
+    dreamer = Dreamer(max_mem=500, k=4)
     
-    # Training loop
+    # Training loop with gradient accumulation and amp.autocast
     model.train()
-    step = 0
+    step = 0  # counts optimizer steps (updates)
+    accum = max(1, args.grad_accum)
     pbar = tqdm(total=config.num_steps, desc="Training")
-    
-    while step < config.num_steps:
+
+    micro_step = 0
+    for epoch_batch in iter(lambda: True, False):
+        # iterate over dataloader until we reach num_steps
         for batch in train_loader:
             if step >= config.num_steps:
                 break
-                
+
             batch = batch.to(device, non_blocking=True)  # Async transfer
-            
-            # Mixed precision training
-            with autocast():
+
+            # Remember for dream
+            try:
+                dreamer.remember(batch.cpu())
+            except Exception:
+                pass
+
+            # Mixed precision training using recommended API
+            with amp.autocast(device_type='cuda'):
                 _, loss = model(batch, labels=batch)
-            
-            # Backward
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
-            
-            step += 1
-            if step % config.log_every == 0:
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            pbar.update(1)
+
+            # Backward with accumulation
+            loss = loss / accum
+            loss.backward()
+            micro_step += 1
+
+            # optimizer step when enough micro-batches accumulated
+            if (micro_step % accum) == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                step += 1
+
+                # Dream phase
+                if step % args.dream_every == 0:
+                    try:
+                        dloss = dreamer.dream(model, tokenizer, optimizer, device, steps=args.dream_steps)
+                        if dloss is not None:
+                            pbar.set_postfix({'loss': f'{loss.item() * accum:.4f}', 'dream_loss': f'{dloss:.4f}'})
+                    except Exception:
+                        pass
+
+                if step % config.log_every == 0:
+                    pbar.set_postfix({'loss': f'{(loss.item() * accum):.4f}'})
+                pbar.update(1)
+        if step >= config.num_steps:
+            break
     
     pbar.close()
     
+    # Build and save dream graph (visualization)
+    try:
+        def _embed_fn(x: torch.Tensor):
+            emb_layer = model.get_input_embeddings() if hasattr(model, 'get_input_embeddings') else model.embed
+            return emb_layer(x)
+
+        print("Building dream graph (this may take a moment)...")
+        dreamer.build_graph(_embed_fn, device=device)
+        dreamer.visualize(out_html='dream_graph.html')
+        print("Dream graph exported to dream_graph.html")
+    except Exception:
+        pass
+
     # Save model
     model_to_save = model.module if hasattr(model, 'module') else model
-    torch.save(model_to_save.state_dict(), "model.pt")
+    
+    # For Qwen, save the inner model's state dict; for Hybrid, save the model itself
+    if args.use_qwen:
+        # HFModelWrapper wraps the actual HF model
+        state_dict_to_save = model_to_save.model.state_dict()
+    else:
+        state_dict_to_save = model_to_save.state_dict()
+    
+    # Save as checkpoint with metadata
+    checkpoint = {
+        'model_type': 'qwen' if args.use_qwen else 'hybrid',
+        'model_name': args.model_name if args.use_qwen else None,
+        'state_dict': state_dict_to_save,
+        'config': config if not args.use_qwen else None,
+    }
+    torch.save(checkpoint, "model.pt")
     print("Model saved to model.pt")
     
     # Quick generation test
     model.eval()
     with torch.no_grad():
         prompt = tokenizer.encode("The future of AI is", return_tensors="pt").to(device)
-        with autocast():
+        with amp.autocast(device_type='cuda'):
             for _ in range(30):
                 logits, _ = model(prompt)
                 next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)

@@ -5,7 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "colorama>=0.4.6",
     "datasets>=4.8.5",
+    "matplotlib>=3.10.9",
+    "pyvis>=0.3.2",
     "torch>=2.12.0",
     "transformers>=5.8.1",
 ]
